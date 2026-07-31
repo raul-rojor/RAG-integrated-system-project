@@ -1,0 +1,88 @@
+%% Music Matcher — RAG integration flow (web-retrieval design)
+%% Two grounded retrievals:
+%%   (A) local Taste Codebook grounds the NL -> user_prefs parse step
+%%   (B) web/music-data documents ground the candidate-song generation step
+%% The generated candidate set feeds the UNCHANGED deterministic scorer.
+%% Every AI step degrades to the deterministic path over the local catalog (offline fallback).
+
+flowchart TD
+    U["🎧 User free-text taste / situation<br/>'late-night drive after a rough day'"]
+
+    subgraph PARSE["(1) Parse — Claude, grounded in the Taste Codebook (RAG)"]
+        LLM1["Claude: NL situation → user_prefs<br/>messages.parse() / schema-validated"]
+        RULES["Rule-based parser<br/>(offline fallback)"]
+    end
+
+    CODEBOOK[["📗 knowledge/taste_codebook.md<br/>valence–arousal · functional context ·<br/>setting cues · vibe glossary · examples<br/>(local, human-owned retrieval corpus)"]]
+
+    PREFS["user_prefs dict<br/>{genre, mood, energy, ...}<br/>(1+ profiles)"]
+
+    subgraph RAG["(2) Retrieve + propose candidates — Claude + web tools (RAG)"]
+        WS["web_search → find candidate songs"]
+        WF["web_fetch → read the surfaced pages"]
+        GEN["Claude generates: real songs<br/>+ feature vectors + citations<br/>(structured output)"]
+    end
+
+    subgraph DOCS["Retrieved documents / sources"]
+        ED[["Editorial lists &amp; 'similar to X' write-ups<br/>→ candidate discovery"]]
+        META[["Wikipedia / MusicBrainz / Discogs<br/>→ genre, mood, year, tempo_bpm"]]
+        LFM[["Last.fm similar tracks &amp; tags<br/>→ discovery, mood"]]
+        AB[["AcousticBrainz (MBID-keyed)<br/>→ energy, valence, danceability, acousticness"]]
+        BPM[["BPM / key databases<br/>→ tempo_bpm"]]
+    end
+
+    NORM["Normalize features<br/>→ 0-1 scales + BPM<br/>(human-owned mapping)"]
+
+    GUARD{"Grounding guardrail:<br/>citation resolves? features in range?<br/>confidence flagged?"}
+
+    subgraph RETRIEVE["Scorer = existing deterministic engine (UNCHANGED)"]
+        SCORE["_score_core / recommend_songs<br/>human-owned weights"]
+    end
+
+    LOCAL[("data/songs.csv<br/>local catalog<br/>(offline fallback)")]
+
+    RANK["Rank candidates"]
+
+    subgraph EXPLAIN["(3) Explain — Claude"]
+        LLM3["Claude: warm prose<br/>from real numeric reasons"]
+        REASONS["Existing reasons list<br/>(offline fallback)"]
+    end
+
+    OUT["🎵 Ranked recommendations + sources<br/>rendered in CLI (src/main.py)"]
+
+    U --> LLM1
+    CODEBOOK -. retrieved by .-> LLM1
+    LLM1 -. "no key / error / refusal" .-> RULES
+    LLM1 --> PREFS
+    RULES --> PREFS
+
+    PREFS --> WS
+    WS --> WF
+    WF --> GEN
+    ED -. retrieved by .-> WF
+    META -. retrieved by .-> WF
+    LFM -. retrieved by .-> WF
+    AB -. retrieved by .-> WF
+    BPM -. retrieved by .-> WF
+    GEN --> NORM
+    NORM --> GUARD
+
+    GEN -. "no key / error / refusal" .-> LOCAL
+    LOCAL --> SCORE
+
+    GUARD -- pass --> SCORE
+    GUARD -- fail --> LOCAL
+    SCORE --> RANK
+    RANK --> LLM3
+    LLM3 --> OUT
+    LLM3 -. "no key / error / refusal" .-> REASONS
+    REASONS --> OUT
+
+    classDef ai fill:#6C4AB6,stroke:#3d2a70,color:#fff;
+    classDef det fill:#1F7A5A,stroke:#0f4433,color:#fff;
+    classDef guard fill:#B54708,stroke:#6e2c05,color:#fff;
+    classDef doc fill:#1663A6,stroke:#0c3a63,color:#fff;
+    class LLM1,LLM3,WS,WF,GEN ai;
+    class SCORE,RULES,REASONS,NORM,LOCAL det;
+    class GUARD guard;
+    class ED,META,LFM,AB,BPM,CODEBOOK doc;
