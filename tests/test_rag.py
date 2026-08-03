@@ -9,6 +9,7 @@ reaches the backend BEFORE it produces output.
 import pytest
 
 from src.rag import (
+    MODEL,
     ClaudeBackend,
     _extract_json,
     build_backend,
@@ -305,11 +306,18 @@ def test_notice_surfaces_the_exception_reason():
     assert "credit balance is too low" in notes[0]
 
 
-def test_propose_notes_on_no_citable_songs():
+def test_propose_notes_quantify_missing_citations():
     notes = []
     propose_candidates([{}], backend=SpyBackend(candidates=[make_candidate(source="")]),
                        catalog=[make_candidate()], notes=notes)
-    assert notes and "no citable" in notes[0]
+    assert notes and "1 songs but 1 lacked a citation" in notes[0]
+
+
+def test_propose_notes_on_zero_songs():
+    notes = []
+    propose_candidates([{}], backend=SpyBackend(candidates=[]),
+                       catalog=[make_candidate()], notes=notes)
+    assert notes and "no songs" in notes[0]
 
 
 def test_propose_success_adds_no_note():
@@ -332,9 +340,28 @@ def test_recommend_threads_notes_to_caller():
     assert any("local catalog" in n for n in notes)
 
 
+def test_recommend_reports_progress_phases():
+    seen = []
+    recommend("party dancing", catalog=[make_candidate()], k=1, progress=seen.append)
+    assert any("parsing" in m for m in seen) and any("finding" in m for m in seen)
+
+
+def test_recommend_reports_per_pick_explain_progress_in_ai_mode():
+    seen = []
+    recommend("upbeat pop", backend=SpyBackend(candidates=[make_candidate(title="W")]),
+              catalog=[make_candidate()], k=1, progress=seen.append)
+    assert any("explaining" in m for m in seen)
+
+
 def test_build_backend_offline_without_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert build_backend() is None
+
+
+def test_model_is_fixed_and_exposed():
+    # The active model is a fixed constant surfaced on the backend (shown to users, not user-settable).
+    assert MODEL == "claude-haiku-4-5"
+    assert ClaudeBackend.MODEL == MODEL
 
 
 def test_claude_backend_extract_and_refusal_helpers():

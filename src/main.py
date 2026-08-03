@@ -40,11 +40,13 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def render(query: str, recs, online: bool, notes=None) -> str:
-    """Build a clean, ranked terminal layout: the query, the mode, any fallback notices, and each pick."""
+def render(query: str, recs, online: bool, notes=None, model=None) -> str:
+    """Build a clean, ranked terminal layout: the query, the mode/model, notices, and each pick."""
     mode = "AI (Claude + RAG)" if online else "offline (deterministic)"
     lines = ["=" * WIDTH, "  🎵  Top Music Recommendations",
              f'  for  "{_truncate(query, WIDTH - 10)}"', f"  mode: {mode}"]
+    if online and model:
+        lines.append(f"  model: {model} (fixed)")
     for note in notes or []:
         wrapped = textwrap.wrap(note, WIDTH - 4) or [note]
         lines.append(f"  ⚠ {wrapped[0]}")
@@ -70,8 +72,16 @@ def main() -> None:
     codebook = load_codebook(str(PROJECT_ROOT / "knowledge" / "taste_codebook.md"))
     backend = build_backend()
     notes: list = []
-    recs = recommend(query, backend=backend, catalog=catalog, codebook=codebook, k=5, notes=notes)
-    print(render(query, recs, online=backend is not None, notes=notes))
+    if backend is not None:
+        print("  … AI mode: contacting Claude (web search can take ~30-90s)", file=sys.stderr, flush=True)
+
+    def status(message: str) -> None:
+        """Print a live progress line to stderr so AI mode never looks frozen."""
+        print(f"  … {message}", file=sys.stderr, flush=True)
+
+    recs = recommend(query, backend=backend, catalog=catalog, codebook=codebook, k=5, notes=notes,
+                     progress=status if backend is not None else None)
+    print(render(query, recs, online=backend is not None, notes=notes, model=getattr(backend, "MODEL", None)))
 
 
 if __name__ == "__main__":

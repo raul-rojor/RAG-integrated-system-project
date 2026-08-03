@@ -13,10 +13,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from src.recommender import TEMPO_MAX, TEMPO_MIN, score_song
+
+# Fixed model for AI mode: the cheapest Claude that still handles structured output + web search well.
+MODEL = "claude-haiku-4-5"
 
 LIST_FEATURES = ("genre", "mood")
 NUMERIC_FEATURES = ("energy", "tempo_bpm", "valence", "danceability", "acousticness")
@@ -214,6 +218,19 @@ def _reason(exc: Exception) -> str:
     return (match.group(1) if match else text).strip()
 
 
+def _progress(progress: Optional[Callable[[str], None]], message: str) -> None:
+    """Emit a coarse phase label to a progress callback when one is supplied."""
+    if progress is not None:
+        progress(message)
+
+
+def _debug(message: str) -> None:
+    """Write a diagnostic line to stderr when MUSIC_MATCHER_DEBUG is set (to inspect raw AI output)."""
+    if os.environ.get("MUSIC_MATCHER_DEBUG"):
+        sys.stderr.write(f"[music-matcher] {message[:2000]}\n")
+        sys.stderr.flush()
+
+
 def parse_taste(query: str, backend: Optional[Backend] = None, codebook: str = "",
                 notes: Optional[List[str]] = None) -> List[dict]:
     """NL situation -> user_prefs; the AI path retrieves codebook sections BEFORE generating."""
@@ -242,14 +259,21 @@ def propose_candidates(prefs: List[dict], backend: Optional[Backend] = None,
     if backend is None:
         return catalog
     try:
-        web = sanitize_candidates(backend.propose(prefs), require_source=True)
+        raw = backend.propose(prefs)
     except Exception as exc:
         _note(notes, f"web song search failed: {_reason(exc)}; using local catalog")
         return catalog
-    if not web:
-        _note(notes, "web song search returned no citable songs; using local catalog")
-        return catalog
-    return web
+    web = sanitize_candidates(raw, require_source=True)
+    if web:
+        return web
+    total = len(raw or [])
+    no_source = sum(1 for c in (raw or []) if isinstance(c, dict) and not c.get("source"))
+    if total == 0:
+        _note(notes, "web song search returned no songs; using local catalog")
+    else:
+        _note(notes, f"web song search returned {total} songs but {no_source} lacked a citation "
+                     "(others failed validation); using local catalog")
+    return catalog
 
 
 def explain(song: dict, reasons: List[str], backend: Optional[Backend] = None) -> str:
@@ -274,13 +298,22 @@ def score_against_profiles(song: dict, prefs_list: List[dict]):
 
 
 def recommend(query: str, backend: Optional[Backend] = None, catalog: Optional[List[dict]] = None,
-              codebook: str = "", k: int = 5, notes: Optional[List[str]] = None) -> List:
+              codebook: str = "", k: int = 5, notes: Optional[List[str]] = None,
+              progress: Optional[Callable[[str], None]] = None) -> List:
     """Full RAG pipeline: parse -> propose -> guardrail -> deterministic score/rank -> explain."""
+    _progress(progress, "parsing your taste")
     prefs_list = parse_taste(query, backend, codebook, notes=notes)
+    _progress(progress, "finding candidate songs")
     candidates = propose_candidates(prefs_list, backend, catalog, notes=notes)
     scored = [(song, *score_against_profiles(song, prefs_list)) for song in candidates]
     scored.sort(key=lambda t: t[1], reverse=True)
-    return [(song, score, explain(song, reasons, backend)) for song, score, reasons in scored[: max(0, k)]]
+    top = scored[: max(0, k)]
+    out = []
+    for i, (song, score, reasons) in enumerate(top, start=1):
+        if backend is not None:
+            _progress(progress, f"explaining pick {i}/{len(top)}")
+        out.append((song, score, explain(song, reasons, backend)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +331,21 @@ _PROFILE_SCHEMA = {
             "acousticness": {"type": "number"}},
         "required": ["genre", "mood"]}}},
     "required": ["profiles"]}
+
+
+_CANDIDATE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"songs": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"}, "artist": {"type": "string"},
+            "genre": {"type": "string"}, "mood": {"type": "string"},
+            "energy": {"type": "number"}, "tempo_bpm": {"type": "number"},
+            "valence": {"type": "number"}, "danceability": {"type": "number"},
+            "acousticness": {"type": "number"}, "source": {"type": "string"}},
+        "required": ["title", "artist", "genre", "mood", "energy", "tempo_bpm",
+                     "valence", "danceability", "acousticness", "source"]}}},
+    "required": ["songs"]}
 
 
 def _extract_json(text: str):
@@ -323,11 +371,17 @@ def _extract_json(text: str):
 class ClaudeBackend:
     """Anthropic Claude adapter: structured NL parsing, web-grounded candidates, prose explanations."""
 
-    MODEL = "claude-opus-5"
+    MODEL = MODEL
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: Optional[str] = None) -> None:
         import anthropic
-        self._client = anthropic.Anthropic()
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=90)  # 90s bound so AI mode can't hang
+        self.debug_log: List[str] = []  # per-run diagnostics the UI can display
+
+    def _trace(self, message: str) -> None:
+        """Record a diagnostic on the backend (for the UI) and echo to stderr under MUSIC_MATCHER_DEBUG."""
+        self.debug_log.append(message)
+        _debug(message)
 
     def parse(self, query: str, context: str) -> List[dict]:
         """Retrieve-then-generate: the codebook `context` is in the prompt BEFORE prefs are emitted."""
@@ -339,15 +393,28 @@ class ClaudeBackend:
         return self._json(prompt, _PROFILE_SCHEMA, system=system).get("profiles", [])
 
     def propose(self, prefs: List[dict]) -> List[dict]:
-        """Web-grounded generation: search/fetch run BEFORE the model lists real songs + citations."""
-        prompt = (
-            "Find up to 8 real, existing songs matching these target preferences: "
-            f"{json.dumps(prefs)}. Use web_search (and web_fetch on the results) to confirm each song "
-            "and gather its audio character. Return ONLY a ```json fenced array; each item {title, "
-            "artist, genre, mood, energy, tempo_bpm, valence, danceability, acousticness, source}. "
-            "Numerics 0-1 except tempo_bpm (BPM). Every item MUST include a non-empty `source` URL you "
-            "actually retrieved; omit any song you cannot cite.")
-        return _extract_json(self._with_web_tools(prompt))
+        """Two-step: web_search to pick real, well-known songs + cite them, THEN format to strict JSON."""
+        genres = sorted({g for p in prefs for g in p.get("genre", [])})
+        moods = sorted({m for p in prefs for m in p.get("mood", [])})
+        research = self._with_web_tools(  # step 1: pick popular real songs, confirm existence + cite
+            "Recommend up to 8 well-known, popular songs a typical listener would actually choose for "
+            "this situation — real songs by real, recognizable artists, NOT royalty-free, stock, or "
+            f"free-download tracks. Target preferences: {json.dumps(prefs)}. Use web_search to confirm "
+            "each song exists and to get a URL for it (Wikipedia, Genius, AllMusic, the artist/album "
+            "page, or a streaming page are all fine). For each song give: title, artist, a confirming "
+            "URL, and your best estimate of its audio character — energy, tempo/BPM, valence, "
+            "danceability, acousticness — from what you know of the song.")
+        self._trace("web research:\n" + (research or "(empty — web_search produced no text)"))
+        system = (f"When labeling songs, prefer these genre tags {genres or 'any'} and mood tags "
+                  f"{moods or 'any'} whenever one reasonably fits, so they align with the listener.")
+        data = self._json(  # step 2: structured output guarantees valid JSON with a source per song
+            "Convert the research below into up to 8 songs as JSON — prefer well-known songs by real "
+            "artists. Put each song's confirming URL in `source`. Estimate audio features from your "
+            "knowledge of the song (0-1 except tempo_bpm in BPM).\n\n"
+            f"RESEARCH:\n{research}", _CANDIDATE_SCHEMA, system=system)
+        songs = data.get("songs", [])
+        self._trace(f"structured step produced {len(songs)} songs")
+        return songs
 
     def explain(self, song: dict, reasons: List[str]) -> str:
         """Rewrite the scorer's numeric reasons as one warm sentence, grounded only in those reasons."""
@@ -366,14 +433,13 @@ class ClaudeBackend:
             kwargs["system"] = system
         return json.loads(self._text(self._client.messages.create(**kwargs)))
 
-    def _with_web_tools(self, prompt: str, max_turns: int = 8) -> str:
-        """Run one turn with web_search/web_fetch, resuming across pause_turn, and return final text."""
-        tools = [{"type": "web_search_20260209", "name": "web_search"},
-                 {"type": "web_fetch_20260209", "name": "web_fetch"}]
+    def _with_web_tools(self, prompt: str, max_turns: int = 6) -> str:
+        """Run a bounded web_search-grounded turn (capped uses/turns), resuming pause_turn, return text."""
+        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
         messages = [{"role": "user", "content": prompt}]
         resp = None
         for _ in range(max_turns):
-            resp = self._client.messages.create(model=self.MODEL, max_tokens=4096, tools=tools, messages=messages)
+            resp = self._client.messages.create(model=self.MODEL, max_tokens=2048, tools=tools, messages=messages)
             if resp.stop_reason != "pause_turn":
                 break
             messages.append({"role": "assistant", "content": resp.content})
@@ -387,15 +453,15 @@ class ClaudeBackend:
         return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
 
-def build_backend() -> Optional[Backend]:
-    """Return a Claude backend if the SDK and ANTHROPIC_API_KEY are present, else None (offline mode)."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+def build_backend(api_key: Optional[str] = None) -> Optional[Backend]:
+    """Return a Claude backend if the SDK and an API key (arg or ANTHROPIC_API_KEY) are present, else None."""
+    if not (api_key or os.environ.get("ANTHROPIC_API_KEY")):
         return None
     try:
         import anthropic  # noqa: F401
     except ImportError:
         return None
     try:
-        return ClaudeBackend()
+        return ClaudeBackend(api_key=api_key)
     except Exception:
         return None

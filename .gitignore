@@ -13,3 +13,6 @@ venv/
 
 # Pytest cache
 .pytest_cache/
+
+# Streamlit secrets — NEVER commit the real key (the .example template is safe to commit)
+.streamlit/secrets.toml
