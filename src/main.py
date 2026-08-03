@@ -1,41 +1,31 @@
 """
-Command line runner for the Music Recommender Simulation.
+Command-line runner for the Music Recommender.
 
-This file helps you quickly run and test your recommender.
+Usage:
+  python -m src.main "late-night drive after a rough day"
 
-You will implement the functions in recommender.py:
-- load_songs
-- score_song
-- recommend_songs
+Describe a situation, mood, or vibe in plain language. With ANTHROPIC_API_KEY set the app runs
+the full Claude + RAG pipeline (src/rag.py); otherwise it falls back to the deterministic offline
+path over the local catalog. All ranking is done by the unchanged scorer in src/recommender.py.
 """
 
 import sys
 from pathlib import Path
 
-# Put both the project root and this src/ directory on sys.path so the import
-# below works whether launched as `python -m src.main`, as a plain script, or
-# from any working directory — and regardless of whether the module is
-# addressed as `src.recommender` or `recommender`.
+# Put the project root and this src/ directory on sys.path so imports work whether launched as
+# `python -m src.main`, as a plain script, or from any working directory.
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 for _path in (PROJECT_ROOT, SRC_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from src.recommender import load_songs, recommend_songs, score_song
+from src.rag import build_backend, load_codebook, recommend
+from src.recommender import load_songs
 
 WIDTH = 62
 TITLE_WIDTH = 40
-
-
-def _format_profile(user_prefs: dict) -> str:
-    """Render the user's preferences as a compact one-line summary."""
-    parts = []
-    for key, value in user_prefs.items():
-        if isinstance(value, (list, tuple)):
-            value = ", ".join(map(str, value))
-        parts.append(f"{key}={value}")
-    return " · ".join(parts)
+DEFAULT_QUERY = "a rainy afternoon studying, lo-fi but a little jazzy"
 
 
 def _score_bar(score: float, width: int = 10) -> str:
@@ -45,49 +35,36 @@ def _score_bar(score: float, width: int = 10) -> str:
 
 
 def _truncate(text: str, limit: int) -> str:
+    """Trim text to `limit` characters with an ellipsis when it overflows."""
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def render_recommendations(recommendations, user_prefs) -> str:
-    """Build a clean, ranked terminal layout: title, score, and reasons."""
-    lines = [
-        "=" * WIDTH,
-        "  🎵  Top Music Recommendations",
-        f"  for  {_format_profile(user_prefs)}",
-        "=" * WIDTH,
-    ]
-
-    if not recommendations:
-        lines += ["", "  No matching songs found.", ""]
-        return "\n".join(lines)
-
-    for rank, (song, score, _explanation) in enumerate(recommendations, start=1):
-        # Pull the structured reasons straight from the scorer.
-        _score, reasons = score_song(user_prefs, song)
-
+def render(query: str, recs, online: bool) -> str:
+    """Build a clean, ranked terminal layout: the query, the mode, and each pick's explanation."""
+    mode = "AI (Claude + RAG)" if online else "offline (deterministic)"
+    lines = ["=" * WIDTH, "  🎵  Top Music Recommendations",
+             f'  for  "{_truncate(query, WIDTH - 10)}"', f"  mode: {mode}", "=" * WIDTH]
+    if not recs:
+        return "\n".join(lines + ["", "  No matching songs found.", "", "=" * WIDTH])
+    for rank, (song, score, expl) in enumerate(recs, start=1):
         name = _truncate(f"{song['title']} — {song['artist']}", TITLE_WIDTH)
-        lines.append("")
-        lines.append(f"  {rank}. {name:<{TITLE_WIDTH}}  {_score_bar(score)} {score:.2f}")
-
-        for i, reason in enumerate(reasons):
-            connector = "└─" if i == len(reasons) - 1 else "├─"
-            lines.append(f"        {connector} {reason}")
-
-    lines.append("")
-    lines.append("=" * WIDTH)
-    return "\n".join(lines)
+        lines += ["", f"  {rank}. {name:<{TITLE_WIDTH}}  {_score_bar(score)} {score:.2f}"]
+        parts = expl.split("; ") if "; " in expl else [expl]
+        for i, part in enumerate(parts):
+            lines.append(f"        {'└─' if i == len(parts) - 1 else '├─'} {part}")
+        if song.get("source"):
+            lines.append(f"           ↪ source: {_truncate(str(song['source']), TITLE_WIDTH)}")
+    return "\n".join(lines + ["", "=" * WIDTH])
 
 
 def main() -> None:
-    # Resolve the data file relative to the project root, not the current
-    # working directory, so the runner works from anywhere.
-    songs = load_songs(str(PROJECT_ROOT / "data" / "songs.csv"))
-
-    # Starter example profile
-    user_prefs = {"genre": "pop", "mood": "happy", "energy": 0.8}
-
-    recommendations = recommend_songs(user_prefs, songs, k=5)
-    print(render_recommendations(recommendations, user_prefs))
+    """Read the situation from argv (or a default), run the pipeline, and print the result."""
+    query = " ".join(sys.argv[1:]).strip() or DEFAULT_QUERY
+    catalog = load_songs(str(PROJECT_ROOT / "data" / "songs.csv"))
+    codebook = load_codebook(str(PROJECT_ROOT / "knowledge" / "taste_codebook.md"))
+    backend = build_backend()
+    recs = recommend(query, backend=backend, catalog=catalog, codebook=codebook, k=5)
+    print(render(query, recs, online=backend is not None))
 
 
 if __name__ == "__main__":
