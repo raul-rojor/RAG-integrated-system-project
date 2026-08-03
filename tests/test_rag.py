@@ -278,6 +278,60 @@ def test_extract_json_fenced_bracket_and_junk():
     assert _extract_json("no json here") == []
 
 
+def test_extract_json_ignores_trailing_citation_brackets():
+    # Regression: a greedy [.*] used to span past the array into citation markers like [1].
+    assert _extract_json('here [{"a": 3}] per source [1] and [2]') == [{"a": 3}]
+
+
+# ---------------------------------------------------------------------------
+# Observability — visible fallback notices
+# ---------------------------------------------------------------------------
+def test_propose_notes_on_backend_exception():
+    notes = []
+    propose_candidates([{}], backend=SpyBackend(raise_on=["propose"]),
+                       catalog=[make_candidate()], notes=notes)
+    assert notes and "failed" in notes[0]
+
+
+def test_notice_surfaces_the_exception_reason():
+    # The concrete error message (e.g. "credit balance is too low") must reach the user, not just the class.
+    class Broke:
+        def parse(self, q, c):
+            raise RuntimeError("Error code: 400 - {'error': {'message': 'credit balance is too low'}}")
+        def propose(self, prefs): return []
+        def explain(self, s, r): return ""
+    notes = []
+    parse_taste("gym", backend=Broke(), codebook=CODEBOOK, notes=notes)
+    assert "credit balance is too low" in notes[0]
+
+
+def test_propose_notes_on_no_citable_songs():
+    notes = []
+    propose_candidates([{}], backend=SpyBackend(candidates=[make_candidate(source="")]),
+                       catalog=[make_candidate()], notes=notes)
+    assert notes and "no citable" in notes[0]
+
+
+def test_propose_success_adds_no_note():
+    notes = []
+    propose_candidates([{}], backend=SpyBackend(candidates=[make_candidate(title="Web")]),
+                       catalog=[make_candidate(title="Local")], notes=notes)
+    assert notes == []
+
+
+def test_parse_taste_notes_on_failure():
+    notes = []
+    parse_taste("gym", backend=SpyBackend(raise_on=["parse"]), codebook=CODEBOOK, notes=notes)
+    assert notes and "parsing failed" in notes[0]
+
+
+def test_recommend_threads_notes_to_caller():
+    notes = []
+    recommend("upbeat pop", backend=SpyBackend(raise_on=["propose"]),
+              catalog=[make_candidate()], codebook=CODEBOOK, notes=notes, k=3)
+    assert any("local catalog" in n for n in notes)
+
+
 def test_build_backend_offline_without_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert build_backend() is None

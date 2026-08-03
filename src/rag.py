@@ -201,7 +201,21 @@ class Backend(Protocol):
 # ---------------------------------------------------------------------------
 # Pipeline steps.
 # ---------------------------------------------------------------------------
-def parse_taste(query: str, backend: Optional[Backend] = None, codebook: str = "") -> List[dict]:
+def _note(notes: Optional[List[str]], message: str) -> None:
+    """Append a human-readable diagnostic to `notes` when the caller is collecting them."""
+    if notes is not None:
+        notes.append(message)
+
+
+def _reason(exc: Exception) -> str:
+    """Extract a concise message from an exception, unwrapping the API error body when present."""
+    text = str(getattr(exc, "message", "") or exc)
+    match = re.search(r"['\"]message['\"]:\s*['\"]([^'\"]+)['\"]", text)
+    return (match.group(1) if match else text).strip()
+
+
+def parse_taste(query: str, backend: Optional[Backend] = None, codebook: str = "",
+                notes: Optional[List[str]] = None) -> List[dict]:
     """NL situation -> user_prefs; the AI path retrieves codebook sections BEFORE generating."""
     if not query or not query.strip():
         return [{}]
@@ -210,21 +224,32 @@ def parse_taste(query: str, backend: Optional[Backend] = None, codebook: str = "
     context = retrieve_sections(query, codebook)  # retrieval happens BEFORE backend.parse()
     try:
         cleaned = [clamp_prefs(p) for p in backend.parse(query, context) if isinstance(p, dict)]
-        return [p for p in cleaned if p] or rule_based_parse(query)
-    except Exception:
+        prefs = [p for p in cleaned if p]
+    except Exception as exc:
+        _note(notes, f"AI taste parsing failed: {_reason(exc)}; used keyword parser")
         return rule_based_parse(query)
+    if prefs:
+        return prefs
+    _note(notes, "AI taste parsing returned nothing usable; used keyword parser")
+    return rule_based_parse(query)
 
 
 def propose_candidates(prefs: List[dict], backend: Optional[Backend] = None,
-                       catalog: Optional[List[dict]] = None) -> List[dict]:
+                       catalog: Optional[List[dict]] = None,
+                       notes: Optional[List[str]] = None) -> List[dict]:
     """user_prefs -> real candidate songs; AI path retrieves web docs first, else uses the local catalog."""
     catalog = catalog or []
     if backend is None:
         return catalog
     try:
-        return sanitize_candidates(backend.propose(prefs), require_source=True) or catalog
-    except Exception:
+        web = sanitize_candidates(backend.propose(prefs), require_source=True)
+    except Exception as exc:
+        _note(notes, f"web song search failed: {_reason(exc)}; using local catalog")
         return catalog
+    if not web:
+        _note(notes, "web song search returned no citable songs; using local catalog")
+        return catalog
+    return web
 
 
 def explain(song: dict, reasons: List[str], backend: Optional[Backend] = None) -> str:
@@ -249,10 +274,10 @@ def score_against_profiles(song: dict, prefs_list: List[dict]):
 
 
 def recommend(query: str, backend: Optional[Backend] = None, catalog: Optional[List[dict]] = None,
-              codebook: str = "", k: int = 5) -> List:
+              codebook: str = "", k: int = 5, notes: Optional[List[str]] = None) -> List:
     """Full RAG pipeline: parse -> propose -> guardrail -> deterministic score/rank -> explain."""
-    prefs_list = parse_taste(query, backend, codebook)
-    candidates = propose_candidates(prefs_list, backend, catalog)
+    prefs_list = parse_taste(query, backend, codebook, notes=notes)
+    candidates = propose_candidates(prefs_list, backend, catalog, notes=notes)
     scored = [(song, *score_against_profiles(song, prefs_list)) for song in candidates]
     scored.sort(key=lambda t: t[1], reverse=True)
     return [(song, score, explain(song, reasons, backend)) for song, score, reasons in scored[: max(0, k)]]
@@ -276,12 +301,23 @@ _PROFILE_SCHEMA = {
 
 
 def _extract_json(text: str):
-    """Pull a JSON array from model text (a fenced ```json block or the first [...] span)."""
-    m = re.search(r"```json\s*(.+?)```", text, re.S) or re.search(r"(\[.*\])", text, re.S)
-    try:
-        return json.loads(m.group(1)) if m else []
-    except json.JSONDecodeError:
-        return []
+    """Return the first JSON array in model text (a fenced ```json block, else the first valid [...] span)."""
+    fenced = re.search(r"```json\s*(.+?)```", text, re.S)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+    decoder = json.JSONDecoder()  # raw_decode from each '[' avoids greedy over-matching past the array
+    for i, ch in enumerate(text):
+        if ch == "[":
+            try:
+                value, _ = decoder.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, list):
+                return value
+    return []
 
 
 class ClaudeBackend:
@@ -306,10 +342,11 @@ class ClaudeBackend:
         """Web-grounded generation: search/fetch run BEFORE the model lists real songs + citations."""
         prompt = (
             "Find up to 8 real, existing songs matching these target preferences: "
-            f"{json.dumps(prefs)}. Search the web to confirm each song and gather its audio character. "
-            "Return ONLY a ```json fenced array; each item {title, artist, genre, mood, energy, "
-            "tempo_bpm, valence, danceability, acousticness, source}. Numerics 0-1 except tempo_bpm "
-            "(BPM); source = a URL you actually retrieved.")
+            f"{json.dumps(prefs)}. Use web_search (and web_fetch on the results) to confirm each song "
+            "and gather its audio character. Return ONLY a ```json fenced array; each item {title, "
+            "artist, genre, mood, energy, tempo_bpm, valence, danceability, acousticness, source}. "
+            "Numerics 0-1 except tempo_bpm (BPM). Every item MUST include a non-empty `source` URL you "
+            "actually retrieved; omit any song you cannot cite.")
         return _extract_json(self._with_web_tools(prompt))
 
     def explain(self, song: dict, reasons: List[str]) -> str:
@@ -329,7 +366,7 @@ class ClaudeBackend:
             kwargs["system"] = system
         return json.loads(self._text(self._client.messages.create(**kwargs)))
 
-    def _with_web_tools(self, prompt: str, max_turns: int = 4) -> str:
+    def _with_web_tools(self, prompt: str, max_turns: int = 8) -> str:
         """Run one turn with web_search/web_fetch, resuming across pause_turn, and return final text."""
         tools = [{"type": "web_search_20260209", "name": "web_search"},
                  {"type": "web_fetch_20260209", "name": "web_fetch"}]

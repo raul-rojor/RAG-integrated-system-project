@@ -10,6 +10,7 @@ path over the local catalog. All ranking is done by the unchanged scorer in src/
 """
 
 import sys
+import textwrap
 from pathlib import Path
 
 # Put the project root and this src/ directory on sys.path so imports work whether launched as
@@ -39,11 +40,16 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def render(query: str, recs, online: bool) -> str:
-    """Build a clean, ranked terminal layout: the query, the mode, and each pick's explanation."""
+def render(query: str, recs, online: bool, notes=None) -> str:
+    """Build a clean, ranked terminal layout: the query, the mode, any fallback notices, and each pick."""
     mode = "AI (Claude + RAG)" if online else "offline (deterministic)"
     lines = ["=" * WIDTH, "  🎵  Top Music Recommendations",
-             f'  for  "{_truncate(query, WIDTH - 10)}"', f"  mode: {mode}", "=" * WIDTH]
+             f'  for  "{_truncate(query, WIDTH - 10)}"', f"  mode: {mode}"]
+    for note in notes or []:
+        wrapped = textwrap.wrap(note, WIDTH - 4) or [note]
+        lines.append(f"  ⚠ {wrapped[0]}")
+        lines.extend(f"    {continuation}" for continuation in wrapped[1:])
+    lines.append("=" * WIDTH)
     if not recs:
         return "\n".join(lines + ["", "  No matching songs found.", "", "=" * WIDTH])
     for rank, (song, score, expl) in enumerate(recs, start=1):
@@ -63,8 +69,9 @@ def main() -> None:
     catalog = load_songs(str(PROJECT_ROOT / "data" / "songs.csv"))
     codebook = load_codebook(str(PROJECT_ROOT / "knowledge" / "taste_codebook.md"))
     backend = build_backend()
-    recs = recommend(query, backend=backend, catalog=catalog, codebook=codebook, k=5)
-    print(render(query, recs, online=backend is not None))
+    notes: list = []
+    recs = recommend(query, backend=backend, catalog=catalog, codebook=codebook, k=5, notes=notes)
+    print(render(query, recs, online=backend is not None, notes=notes))
 
 
 if __name__ == "__main__":
